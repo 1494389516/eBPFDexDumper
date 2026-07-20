@@ -142,21 +142,31 @@ func (p *DexParser) GetString(stringIdx uint32) (string, error) {
 }
 
 // 读取字符串数据
+//
+// DEX 的 string_data_item 为: uleb128 编码的 utf16_size(UTF-16 代码单元数，
+// 并非字节数)，后跟以 0x00 结尾的 MUTF-8 字节序列。字符串的实际字节长度并不等于
+// utf16_size —— 非 ASCII 字符的 MUTF-8 编码会占用多个字节，若按 utf16_size 截取
+// 字节会把类名/方法名截断。因此这里扫描到 NUL 结束符来确定真实长度;MUTF-8 把真正
+// 的 NUL 编码成 0xC0 0x80，所以 0x00 字节一定是字符串结束标志。
 func (p *DexParser) readStringData(offset uint32) (string, error) {
 	if int(offset) >= len(p.data) {
 		return "", fmt.Errorf("string data offset out of bounds")
 	}
 
-	// 读取ULEB128长度
+	// 跳过 uleb128 的 utf16_size 前缀(仅是长度提示，不代表字节数)
 	pos := int(offset)
-	length, newPos := p.readULEB128(pos)
-	pos = newPos
+	_, pos = p.readULEB128(pos)
 
-	if pos+int(length) > len(p.data) {
-		return "", fmt.Errorf("string data out of bounds")
+	// 从 pos 扫描到 NUL 结束符，得到实际字节长度
+	end := pos
+	for end < len(p.data) && p.data[end] != 0x00 {
+		end++
+	}
+	if end >= len(p.data) {
+		return "", fmt.Errorf("string data not NUL-terminated")
 	}
 
-	return string(p.data[pos : pos+int(length)]), nil
+	return string(p.data[pos:end]), nil
 }
 
 // 读取ULEB128
