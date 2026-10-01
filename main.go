@@ -50,6 +50,30 @@ SUBCOMMANDS:
 		HideHelpCommand: true,
 		Commands: []*cli.Command{
 			{
+				Name:  "inspect",
+				Usage: "Read-only verification of run manifests, artifacts and provenance",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Required: true},
+					&cli.BoolFlag{Name: "json", Usage: "Print JSON report to stdout"},
+				},
+				Action: func(c *cli.Context) error {
+					if c.Args().Len() != 0 {
+						return cli.Exit("unexpected positional arguments", 2)
+					}
+					report, err := InspectDirectory(c.String("dir"))
+					if err != nil {
+						return cli.Exit(err, 2)
+					}
+					if err = PrintInspectReport(os.Stdout, report, c.Bool("json")); err != nil {
+						return cli.Exit(err, 2)
+					}
+					if len(report.Issues) > 0 {
+						return cli.Exit("inspection found issues", 1)
+					}
+					return nil
+				},
+			},
+			{
 				Name:        "dump",
 				Usage:       "Start eBPF-based DEX dumper",
 				Description: "Attach uprobes to libart and stream DEX/method events; provide either --uid or --name to filter.",

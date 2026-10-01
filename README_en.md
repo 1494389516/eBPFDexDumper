@@ -318,3 +318,28 @@ reuse cannot be distinguished when process identity was unavailable; module
 reloads reusing the same path/base and process replacement during delayed event
 delivery also exceed this snapshot model. Runtime capture still requires testing
 on a rooted Android device.
+
+### Offline inspection
+
+Use `eBPFDexDumper inspect --dir <run-or-parent> [--json]` on Android, or build
+the standalone portable inspector with no BPF object, NDK or cgo dependency:
+
+```sh
+go build -o ebpf-inspect ./cmd/inspect
+./ebpf-inspect --dir ./output --json
+```
+
+Inspection is read-only. It recursively checks manifests, schema/IDs/status,
+file existence/size/SHA-256, unavailable process identity, repair input links,
+JNI source compatibility and journal/manifest agreement. Traversal paths,
+absolute artifact paths and symlinks are rejected. Broken journal records,
+missing entries and conflicts are reported.
+
+Exit codes: 0 = no findings; 1 = findings (including partial/degraded/running or
+unknown identity); 2 = invocation/root-directory/output failure. JSON is written
+to stdout. Inspect the common parent of capture and repair runs to resolve
+cross-run inputs; otherwise external references are reported as unresolved.
+Legacy sha256 input references are format-checked only, not counted as verified
+files. A directory without manifests reports no_manifest. This is consistency
+checking, not full DEX/ELF validation or source authentication. Prefer inspecting
+stopped runs to avoid races with ongoing capture.
