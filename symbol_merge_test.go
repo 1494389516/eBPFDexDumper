@@ -23,21 +23,21 @@ func soWithDynamicSegment() []byte {
 
 func TestNestedSoRepairPreservesJniSymbolRouting(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"libtarget", "libother"} {
+	for _, name := range []string{"libtarget", "libother", "other_libtarget", "so_123_abcd_1000_other_libtarget"} {
 		writeTestFile(t, filepath.Join(dir, "nested", name+".so"), soWithDynamicSegment())
 	}
 	syms := []InjectedSym{{Name: "nativeMethod", Value: 128}}
 	if err := FixSoDirectory(dir, syms, "libtarget"); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"libtarget", "libother"} {
+	for _, name := range []string{"libtarget", "libother", "other_libtarget", "so_123_abcd_1000_other_libtarget"} {
 		f, err := elf.Open(filepath.Join(dir, "fix", "nested", name+"_fix.so"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		symbols, err := f.Symbols()
 		f.Close()
-		if name == "libother" {
+		if name != "libtarget" {
 			if err == nil && len(symbols) > 0 {
 				t.Fatal("JNI symbols injected into an unrelated library")
 			}

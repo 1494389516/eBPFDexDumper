@@ -201,7 +201,21 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 // <stem>.so (a user-renamed file) matches too.
 func soMatchesModule(soFileName, stem string) bool {
 	base := sanitizeSoName(soFileName)
-	return base == stem || strings.HasSuffix(base, "_"+stem)
+	if base == stem {
+		return true
+	}
+	// Only strip the exact prefix emitted by dumpso. An arbitrary suffix
+	// match also accepts unrelated modules such as other_libfoo.so.
+	parts := strings.SplitN(base, "_", 5)
+	if len(parts) != 5 || parts[0] != "so" || parts[4] != stem {
+		return false
+	}
+	for i, radix := range []int{10, 16, 16} {
+		if _, err := strconv.ParseUint(parts[i+1], radix, 64); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // parseSymbolFile reads an "offset name" map (one entry per line, blank lines
