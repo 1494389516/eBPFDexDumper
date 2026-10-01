@@ -283,3 +283,38 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Disclaimer
 
 This tool is intended for educational and defensive security research purposes only. Users are responsible for ensuring compliance with applicable laws and regulations.
+## Run records and provenance
+
+`dump` / `dumpso` now create and print a unique `<out>/<run_id>` directory with
+`manifest.json` (schema 1), append-and-sync `events.jsonl`, `dumps/`, `symbols/`
+and automatic repair outputs in `fix/`. The manifest is replaced atomically.
+It records timestamps, command mode, build version, SHA-256, file size/status,
+PID, process start ticks, boot ID, available UID/name, module path and base.
+Addresses are hexadecimal strings. Missing process identity is explicit.
+
+DEX caches/chunks/code records are separated by process lifetime and address.
+SO watch captures retain separate versions and label partial reads; incomplete
+DEX and failed reads are recorded. JNI module identity is observed while handling
+the event, rather than reconstructed only at shutdown. Unresolved symbols remain
+in the raw capture and are not guessed into another module.
+
+Standalone `fix -d <run>` and `fixso -d <run>` create
+`<run>/records/<repair_run_id>/` containing their manifest, journal and `fix/`
+outputs. Existing `fix/` and `records/` directories are excluded from traversal.
+Legacy input directories remain supported. Repairs reference input artifact IDs
+(or content hashes for legacy files), and record failures and header-only fallback.
+
+`fixso` automatically finds a unique, content-verified JNI map in the same run
+with matching PID/start ticks/boot ID/module path/base. For separate capture runs,
+use `fixso -d <so_run> --symbols <dex_run>/symbols/jni_symbols_<id>.txt`.
+Recorded maps require recorded SO identity; corrupt metadata, hash mismatches and
+ambiguous maps do not fall back to filename matching. Legacy maps retain existing
+filename routing, including explicit hand-written maps.
+
+A killed run may remain `running`; it is not evidence of completion. The journal
+and manifest are not one transaction and automatic recovery is not implemented.
+Hashes do not authenticate provenance or prevent whole-log replacement. PID
+reuse cannot be distinguished when process identity was unavailable; module
+reloads reusing the same path/base and process replacement during delayed event
+delivery also exceed this snapshot model. Runtime capture still requires testing
+on a rooted Android device.

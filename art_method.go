@@ -23,15 +23,15 @@ type ArtMethod struct {
 // Dex文件缓存
 type DexFileCache struct {
 	mu      sync.RWMutex
-	parsers map[uint64]*DexParser
+	parsers map[dexIdentity]*DexParser
 }
 
 var dexCache = &DexFileCache{
-	parsers: make(map[uint64]*DexParser),
+	parsers: make(map[dexIdentity]*DexParser),
 }
 
 // 添加Dex文件到缓存
-func (cache *DexFileCache) AddDexFile(begin uint64, data []byte) error {
+func (cache *DexFileCache) AddDexFile(begin dexIdentity, data []byte) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
@@ -41,12 +41,12 @@ func (cache *DexFileCache) AddDexFile(begin uint64, data []byte) error {
 	}
 
 	cache.parsers[begin] = parser
-	log.Printf("Added dex file to cache: begin=0x%x, size=%d", begin, len(data))
+	log.Printf("Added dex file to cache: begin=0x%x, size=%d", begin.Begin, len(data))
 	return nil
 }
 
 // 从缓存获取Dex解析器
-func (cache *DexFileCache) GetParser(begin uint64) *DexParser {
+func (cache *DexFileCache) GetParser(begin dexIdentity) *DexParser {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
@@ -110,7 +110,7 @@ func PrettyMethodFromArtMethod(pid uint32, artMethodPtr uintptr) (string, error)
 	}
 
 	// 从缓存获取Dex解析器
-	parser := dexCache.GetParser(dexFileBegin)
+	parser := dexCache.GetParser(dexID(pid, dexFileBegin))
 	if parser == nil {
 		return "", fmt.Errorf("dex file not found in cache: begin=0x%x", dexFileBegin)
 	}

@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	cli "github.com/urfave/cli/v2"
@@ -77,7 +79,7 @@ OPTIONS:
 					&cli.Uint64Flag{Name: "nterp-offset", Usage: "Manual offset for ExecuteNterpImpl function (hex value, e.g. 0x12345)"},
 					&cli.Uint64Flag{Name: "register-natives-offset", Usage: "Manual offset for art::JNI<>::RegisterNatives (hex value, e.g. 0x12345); auto-detected via symbol or string xref when omitted"},
 				},
-				Action: func(c *cli.Context) error {
+				Action: func(c *cli.Context) (runErr error) {
 					uid := uint32(c.Uint64("uid"))
 					pkgName := c.String("name")
 					libArtPath := c.String("libart")
@@ -106,6 +108,13 @@ OPTIONS:
 						log.Printf("[+] Resolved UID %d from package %q", uid, pkgName)
 					}
 
+					run, err := startRecordedRun(outputDir, "dump")
+					if err != nil {
+						return err
+					}
+					defer finishRecordedRun(run, &runErr)
+					outputDir = run.Root
+					log.Printf("[+] Run directory: %s", outputDir)
 					// Optional: remove oat/ to get more complete structures
 					if cleanOat {
 						if pkgName != "" {
@@ -116,6 +125,7 @@ OPTIONS:
 					}
 
 					dumper := NewDexDumper(libArtPath, uid, outputDir, trace, autoFix, executeOffset, nterpOffset, registerNativesOffset)
+					defer func() { runErr = errors.Join(runErr, dumper.Stop()) }()
 
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()
@@ -140,10 +150,7 @@ OPTIONS:
 					if err := dumper.Start(ctx); err != nil {
 						return fmt.Errorf("failed to start dumper: %w", err)
 					}
-					if err := dumper.Stop(); err != nil {
-						log.Printf("Failed to stop dumper cleanly: %v", err)
-					}
-					log.Println("DexDumper stopped")
+
 					return nil
 				},
 			},
@@ -166,8 +173,19 @@ OPTIONS:
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Usage: "Directory containing dumped DEX files", Required: true},
 				},
-				Action: func(c *cli.Context) error {
+				Action: func(c *cli.Context) (runErr error) {
 					outDir := c.String("dir")
+					if info, err := os.Stat(outDir); err != nil {
+						return err
+					} else if !info.IsDir() {
+						return fmt.Errorf("not a directory: %s", outDir)
+					}
+					run, err := startRecordedRun(filepath.Join(outDir, "records"), c.Command.Name)
+					if err != nil {
+						return err
+					}
+					defer finishRecordedRun(run, &runErr)
+					log.Printf("[+] Repair run directory: %s", run.Root)
 					if err := FixDexDirectory(outDir); err != nil {
 						return fmt.Errorf("fix dex failed: %w", err)
 					}
@@ -205,7 +223,7 @@ OPTIONS:
 					&cli.Uint64Flag{Name: "watch-interval", Usage: "Seconds between map re-scans in --watch mode", Value: 1},
 					&cli.Uint64Flag{Name: "watch-timeout", Usage: "Stop --watch after N seconds (0 = until interrupted)", Value: 60},
 				},
-				Action: func(c *cli.Context) error {
+				Action: func(c *cli.Context) (runErr error) {
 					uid := uint32(c.Uint64("uid"))
 					pkgName := c.String("name")
 					libFilter := c.String("lib")
@@ -233,6 +251,13 @@ OPTIONS:
 						log.Printf("[+] Resolved UID %d from package %q", uid, pkgName)
 					}
 
+					run, err := startRecordedRun(outputDir, "dumpso")
+					if err != nil {
+						return err
+					}
+					defer finishRecordedRun(run, &runErr)
+					outputDir = run.Root
+					log.Printf("[+] Run directory: %s", outputDir)
 					var dumped []string
 					if watch {
 						var ctx context.Context
@@ -267,6 +292,7 @@ OPTIONS:
 						for _, pid := range pids {
 							mods, err := ScanSoModules(pid, libFilter, includeAnon, includeSystem)
 							if err != nil {
+								recordFailure("so_scan", processSource(uint32(pid), 0), err)
 								log.Printf("[!] scan failed for pid %d: %v", pid, err)
 								continue
 							}
@@ -278,7 +304,7 @@ OPTIONS:
 					if autoFix && len(dumped) > 0 {
 						log.Printf("[+] Auto-fixing dumped .so files...")
 						if err := FixSoDirectory(outputDir, nil, ""); err != nil {
-							log.Printf("[!] Auto-fix failed: %v", err)
+							return fmt.Errorf("auto-fix: %w", err)
 						}
 					}
 
@@ -306,8 +332,19 @@ OPTIONS:
 					&cli.StringFlag{Name: "dir", Aliases: []string{"d"}, Usage: "Directory containing dumped .so files", Required: true},
 					&cli.StringFlag{Name: "symbols", Aliases: []string{"s"}, Usage: "File of 'offset name' lines to inject as .symtab symbols (e.g. recovered JNI functions)"},
 				},
-				Action: func(c *cli.Context) error {
+				Action: func(c *cli.Context) (runErr error) {
 					outDir := c.String("dir")
+					if info, err := os.Stat(outDir); err != nil {
+						return err
+					} else if !info.IsDir() {
+						return fmt.Errorf("not a directory: %s", outDir)
+					}
+					run, err := startRecordedRun(filepath.Join(outDir, "records"), c.Command.Name)
+					if err != nil {
+						return err
+					}
+					defer finishRecordedRun(run, &runErr)
+					log.Printf("[+] Repair run directory: %s", run.Root)
 					var injected []InjectedSym
 					var symbolsTarget string
 					if sf := c.String("symbols"); sf != "" {
@@ -320,10 +357,10 @@ OPTIONS:
 						if symbolsTarget != "" {
 							log.Printf("[+] Loaded %d symbol(s) from %s (target module %q)", len(injected), sf, symbolsTarget)
 						} else {
-							log.Printf("[+] Loaded %d symbol(s) from %s; couldn't infer target module, will inject into every .so", len(injected), sf)
+							log.Printf("[+] Loaded %d symbol(s) from %s; target will be resolved from provenance or legacy matching", len(injected), sf)
 						}
 					}
-					if err := FixSoDirectory(outDir, injected, symbolsTarget); err != nil {
+					if err := FixSoDirectory(outDir, injected, symbolsTarget, c.String("symbols")); err != nil {
 						return fmt.Errorf("fix so failed: %w", err)
 					}
 					log.Printf("Fix completed for directory: %s", outDir)
@@ -331,7 +368,7 @@ OPTIONS:
 				},
 			},
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(c *cli.Context) (runErr error) {
 			// Default to "dump" to keep UX simple when not specifying subcommand
 			return cli.ShowAppHelp(c)
 		},

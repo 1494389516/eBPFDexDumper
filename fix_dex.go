@@ -23,7 +23,7 @@ type jsonRepairRecord struct {
 // FixDexDirectory scans an output directory, pairs dex and code.json, and writes *_fix.dex
 func FixDexDirectory(outputDir string) error {
 	outputDir = filepath.Clean(outputDir)
-	fixDir := filepath.Join(outputDir, "fix")
+	fixDir := repairOutputDir(outputDir)
 	// regex like: dex_<begin>_<size>_code.json
 	re := regexp.MustCompile(`^dex_([0-9a-fA-F]+)_([0-9a-fA-F]+)_code\.json$`)
 
@@ -36,7 +36,7 @@ func FixDexDirectory(outputDir string) error {
 			return err
 		}
 		if d.IsDir() {
-			if path == fixDir {
+			if path == fixDir || d.Name() == "records" || d.Name() == "fix" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -80,7 +80,12 @@ func FixDexDirectory(outputDir string) error {
 }
 
 // FixOneDex applies JSON code patches into a single dex file and writes to outPath
-func FixOneDex(dexPath, jsonPath, outPath string) error {
+func FixOneDex(dexPath, jsonPath, outPath string) (result error) {
+	inputs, src, inputErr := repairInputs(dexPath, jsonPath)
+	defer func() { result = recordFile(outPath, "fixed_dex", "complete", "dex_patch", src, inputs, result) }()
+	if inputErr != nil {
+		return inputErr
+	}
 	dexBytes, err := os.ReadFile(dexPath)
 	if err != nil {
 		return fmt.Errorf("read dex: %w", err)

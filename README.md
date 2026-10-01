@@ -288,3 +288,40 @@ adb shell find /system -name "libart.so" 2>/dev/null
 ## 免责声明
 
 此工具仅用于教育和防御性安全研究目的。用户有责任确保符合适用的法律法规。
+## 运行记录与来源关联
+
+`dump` 和 `dumpso` 会在 `--out` 下创建独立运行目录，启动时打印实际路径：
+
+```
+output/<run_id>/
+  manifest.json
+  events.jsonl
+  dumps/
+  symbols/
+  fix/
+```
+
+- `manifest.json` 使用 schema version 1，记录运行 ID、模式、构建版本、起止时间、运行状态和产物清单；通过临时文件替换更新。进程被强制终止时可能保留 `running`，不代表转储完成。
+- `events.jsonl` 逐条追加并同步产物/失败记录。记录包含相对路径、SHA-256、字节数、状态、PID、启动 ticks、boot ID，以及可获得的 UID/进程名、模块路径与加载基址。地址采用十六进制字符串，避免 JSON 数字精度丢失。
+- DEX 缓存、分片和方法记录按进程实例与地址隔离。不同进程的同一地址不会共用输出；进程身份无法读取时会显式标记，不声称能识别这类情况下的 PID 复用。
+- SO 的 watch 重抓保留独立版本；部分读取标为 `partial`，记录实际读取字节数（不能据此定位每个缺页）。未收齐的 DEX 和读取失败也有记录。
+- JNI 模块身份在事件处理时采集，按进程实例、模块路径和基址拆分符号文件；无法解析的地址留在 raw 记录并报告失败，不猜测归属。模块卸载/重载恰好复用同一路径和基址、或事件延迟期间发生进程替换，不在当前身份快照的保证范围内。
+
+### 修复及符号关联
+
+```sh
+# 使用日志中打印的运行目录。原有无 manifest 的目录也可修复。
+./eBPFDexDumper fix -d output/<dex_run_id>
+./eBPFDexDumper fixso -d output/<so_run_id>
+
+# dump 与 dumpso 分别运行时，可指定另一运行中的 JNI 符号文件。
+./eBPFDexDumper fixso -d output/<so_run_id> --symbols output/<dex_run_id>/symbols/jni_symbols_<id>.txt
+```
+
+独立执行 `fix`/`fixso` 时，修复记录与输出位于输入目录的 `records/<repair_run_id>/`，其中 `fix/` 保留原始相对目录。不会递归修复已有 `fix/` 和 `records/`。自动修复则写入捕获运行的 `fix/`。
+
+有来源记录时，`fixso` 自动查找同一运行中身份完全匹配的 JNI 符号；跨运行显式传入符号文件时，同样验证进程实例、模块路径、基址及文件 SHA-256。清单损坏、内容改变或存在多个候选时返回错误，不降级成文件名猜测。无来源的旧式符号文件仍使用既有命名规则；手写映射仍可由 `--symbols` 显式指定。
+
+每个修复产物记录输入产物 ID（旧文件用内容哈希标识）、执行方式、错误及降级原因。只有文件头修复时标为 `degraded`；失败不会伪装成完整修复。清单/日志写入失败会影响命令退出结果。
+
+这些记录是来源快照和内容一致性检查，不是防篡改审计证明。两个文件之间没有事务保证；崩溃时可用 JSONL 辅助排查，但目前不自动恢复清单。Android/eBPF 的实际采集行为仍需 root 真机验证。

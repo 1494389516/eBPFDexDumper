@@ -276,18 +276,24 @@ func readRemoteRange(pid int, base uint64, buf []byte) int {
 func DumpSoModules(pid int, mods []soModule, outDir string) []string {
 	var written []string
 	for _, m := range mods {
+		src := processSource(uint32(pid), m.Base)
+		src.ModulePath = m.Path
 		size := m.End - m.Base
+		src.ExpectedBytes = size
 		if size == 0 {
 			continue
 		}
 		if size > maxSoDumpSize {
+			recordFailure("so", src, fmt.Errorf("module size %d exceeds safety cap", size))
 			log.Printf("[so-dump] skip %s: size %d exceeds safety cap %d", m.Name, size, maxSoDumpSize)
 			continue
 		}
 
 		buf := make([]byte, size)
 		got := readRemoteRange(pid, m.Base, buf)
+		src.ReadBytes = uint64(got)
 		if got == 0 {
+			recordFailure("so", src, fmt.Errorf("no readable bytes"))
 			log.Printf("[so-dump] failed to read %s (pid=%d, 0x%x-0x%x)", m.Name, pid, m.Base, m.End)
 			continue
 		}
@@ -295,11 +301,22 @@ func DumpSoModules(pid int, mods []soModule, outDir string) []string {
 			log.Printf("[so-dump] partial read for %s: %d/%d bytes captured", m.Name, got, size)
 		}
 
-		fname := fmt.Sprintf("%s/so_%d_%x_%x_%s.so", outDir, pid, m.Base, size, sanitizeSoName(m.Name))
-		if err := os.WriteFile(fname, buf, 0644); err != nil {
-			log.Printf("[so-dump] write failed for %s: %v", fname, err)
+		// Each observation has its own directory, preserving watch-mode versions.
+		id, err := newID()
+		if err != nil {
+			recordFailure("so", src, err)
 			continue
 		}
+		fname := filepath.Join(outDir, "dumps", id, fmt.Sprintf("so_%d_%x_%x_%s.so", pid, m.Base, size, sanitizeSoName(m.Name)))
+		status := "complete"
+		if uint64(got) < size {
+			status = "partial"
+		}
+		if err := writeArtifact(fname, buf, "so", status, src); err != nil {
+			log.Printf("[so-dump] write failed: %v", err)
+			continue
+		}
+
 		log.Printf("[so-dump] saved %s (size=%d)", fname, size)
 		written = append(written, fname)
 	}
@@ -326,8 +343,7 @@ type modWatchState struct {
 // wasn't there on the previous scan. interval bounds how often maps are
 // re-scanned.
 //
-// A region is dumped on first appearance and re-dumped (overwriting the earlier
-// file) whenever its sampled contents change, up to watchMaxRedumps times. This
+// A region is dumped on first appearance and re-dumped (preserving each version) whenever its sampled contents change, up to watchMaxRedumps times. This
 // catches packers that map a region and only then decrypt it in place — keying
 // on (pid, base, end) alone would freeze the too-early, still-encrypted capture.
 func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon, includeSystem bool, outDir string, interval time.Duration) []string {
@@ -349,7 +365,7 @@ func WatchAndDump(ctx context.Context, uid uint32, libFilter string, includeAnon
 			}
 			var fresh []soModule
 			for _, m := range mods {
-				key := fmt.Sprintf("%d_%x_%x", pid, m.Base, m.End)
+				key := fmt.Sprintf("%s_%x_%x", sourceKey(processSource(uint32(pid), m.Base)), m.Base, m.End)
 				st, ok := seen[key]
 				if ok && st.dumps >= watchMaxRedumps {
 					continue // settled: stop re-reading it
