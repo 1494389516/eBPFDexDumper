@@ -107,42 +107,32 @@ func FixOneDex(dexPath, jsonPath, outPath string) error {
 	if err := dec.Decode(&records); err != nil {
 		return fmt.Errorf("decode json: %w", err)
 	}
-	// log.Printf("Read %d records from %v\n", len(records), method2off)
-	var applied, skipped, mismatched int
+	var applied, skipped int
 	for _, r := range records {
-
 		codeOff, ok := method2off[r.MethodIdx]
-		// log.Printf("Patching name %s method_idx %d, code_off 0x%X\n", r.Name, r.MethodIdx, codeOff)
 		if !ok || codeOff == 0 {
 			skipped++
 			continue
 		}
-		// Get code header insns_size
-		if int(codeOff)+0x10 > len(dexBytes) {
-			skipped++
-			continue
+		// Validate the entire code item and exact instruction length before
+		// patching. Partial instructions must never be reported as a repair.
+		header, err := parser.dataRange(uint64(codeOff), 0x10)
+		if err != nil {
+			return fmt.Errorf("method %d code header: %w", r.MethodIdx, err)
 		}
-		insnsUnits := le32(dexBytes[int(codeOff)+0x0c:])
-		expLen := int(insnsUnits) * 2
-
+		expLen := uint64(le32(header[0x0c:])) * 2
+		instructions, err := parser.dataRange(uint64(codeOff)+0x10, expLen)
+		if err != nil {
+			return fmt.Errorf("method %d instructions: %w", r.MethodIdx, err)
+		}
 		codeBytes, err := hex.DecodeString(r.CodeHex)
 		if err != nil {
-			skipped++
-			continue
+			return fmt.Errorf("method %d invalid code hex: %w", r.MethodIdx, err)
 		}
-		// Only patch up to min length; track mismatch
-		writeLen := expLen
-		if len(codeBytes) < writeLen {
-			writeLen = len(codeBytes)
+		if uint64(len(codeBytes)) != expLen {
+			return fmt.Errorf("method %d instruction length mismatch: got %d, want %d", r.MethodIdx, len(codeBytes), expLen)
 		}
-		if int(codeOff)+0x10+writeLen > len(dexBytes) {
-			skipped++
-			continue
-		}
-		if writeLen != len(codeBytes) || writeLen != expLen {
-			mismatched++
-		}
-		copy(dexBytes[int(codeOff)+0x10:int(codeOff)+0x10+writeLen], codeBytes[:writeLen])
+		copy(instructions, codeBytes)
 		applied++
 	}
 
@@ -153,7 +143,7 @@ func FixOneDex(dexPath, jsonPath, outPath string) error {
 		return fmt.Errorf("write out: %w", err)
 	}
 
-	fmt.Fprintf(os.Stdout, "Applied: %d, Skipped: %d, LengthMismatch: %d for %s\n", applied, skipped, mismatched, filepath.Base(dexPath))
+	fmt.Fprintf(os.Stdout, "Applied: %d, Skipped: %d for %s\n", applied, skipped, filepath.Base(dexPath))
 	return nil
 }
 
