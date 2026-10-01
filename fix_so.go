@@ -29,7 +29,15 @@ const ptLoad = 1
 // every PT_LOAD segment's p_offset to equal p_vaddr and p_filesz up to p_memsz,
 // then zero the section header table (which was never part of the memory image)
 // so tools at least load the file via its program headers.
-func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
+func FixOneSo(soPath, outPath string, injected []InjectedSym, symbolInputs ...string) (result error) {
+	inputs, src, inputErr := repairInputs(soPath)
+	inputs = append(inputs, symbolInputs...)
+	operation, status := "section_rebuild", "complete"
+	note := ""
+	defer func() { result = recordFile(outPath, "fixed_so", status, operation, src, inputs, result, note) }()
+	if inputErr != nil {
+		return inputErr
+	}
 	data, err := os.ReadFile(soPath)
 	if err != nil {
 		return fmt.Errorf("read so: %w", err)
@@ -57,13 +65,17 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 		if n, cerr := SelfCheckSo(rebuilt); cerr == nil {
 			log.Printf("[fixso] %s: rebuilt section headers, %d dynamic symbols readable", filepath.Base(outPath), n)
 		} else {
+			status = "degraded"
+			note = cerr.Error()
 			log.Printf("[fixso] %s: rebuilt section headers, but self-check couldn't read symbols: %v", filepath.Base(outPath), cerr)
 		}
 		return nil
 	} else {
+		note = rerr.Error()
 		log.Printf("[fixso] section rebuild unavailable for %s (%v); falling back to header-only fix", filepath.Base(soPath), rerr)
 	}
 
+	operation, status = "header_only", "degraded"
 	// Fallback: normalize p_offset and zero out the section header table,
 	// class-aware so both ELF32 and ELF64 dumps still load via program headers.
 	phoff := l.phoff(data)
@@ -120,7 +132,7 @@ func FixOneSo(soPath, outPath string, injected []InjectedSym) error {
 // offsets that mean nothing in their address space. An empty symbolsTarget with
 // a non-empty injected set means the origin couldn't be determined (e.g. a
 // hand-written map): fall back to injecting into every .so.
-func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) error {
+func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string, symbolFiles ...string) error {
 	dir = filepath.Clean(dir)
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -130,7 +142,7 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 		return fmt.Errorf("not a directory: %s", dir)
 	}
 
-	fixDir := filepath.Join(dir, "fix")
+	fixDir := repairOutputDir(dir)
 	if err := os.MkdirAll(fixDir, 0755); err != nil {
 		return fmt.Errorf("failed to create fix dir %s: %w", fixDir, err)
 	}
@@ -142,7 +154,7 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 			return err
 		}
 		if d.IsDir() {
-			if path == fixDir {
+			if path == fixDir || d.Name() == "records" || d.Name() == "fix" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -163,10 +175,24 @@ func FixSoDirectory(dir string, injected []InjectedSym, symbolsTarget string) er
 		}
 		// Keep module-relative JNI symbols confined to their source library.
 		var syms []InjectedSym
-		if len(injected) > 0 && (symbolsTarget == "" || soMatchesModule(name, symbolsTarget)) {
-			syms = injected
+		var symbolIDs []string
+		var routeErr error
+		if len(symbolFiles) > 0 && symbolFiles[0] != "" {
+			syms, symbolIDs, routeErr = routeSymbolFile(path, symbolFiles[0], injected, symbolsTarget)
+		} else if len(injected) > 0 {
+			if symbolsTarget == "" || soMatchesModule(name, symbolsTarget) {
+				syms = injected
+			}
+		} else {
+			syms, symbolIDs, routeErr = recordedSymbols(path)
 		}
-		if err := FixOneSo(path, outPath, syms); err != nil {
+		if routeErr != nil {
+			failures = append(failures, routeErr)
+			recordFailure("symbol_routing", Source{}, routeErr)
+			return nil
+		}
+
+		if err := FixOneSo(path, outPath, syms, symbolIDs...); err != nil {
 			fmt.Fprintf(os.Stdout, "[!] Fix failed for %s: %v\n", path, err)
 			failures = append(failures, fmt.Errorf("fix %s: %w", path, err))
 			return nil

@@ -3,9 +3,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,8 +14,8 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
-	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +34,8 @@ var outputPath string
 
 // 方法事件处理任务
 type methodTask struct {
-	data []byte
+	identity dexIdentity
+	data     []byte
 }
 
 type DexDumper struct {
@@ -48,19 +49,19 @@ type DexDumper struct {
 	registerNativesOffset uint64
 
 	// 使用sync.Map减少锁竞争
-	methodSigCache sync.Map // key: uint64(begin<<32|methodIndex), value: string
+	methodSigCache sync.Map // key: process/DEX identity plus method index
 
 	// 记录dex文件大小，便于生成文件名 dex<begin>_<size>_code.json
 	dexSizesMu sync.RWMutex
-	dexSizes   map[uint64]uint32 // Begin -> Size
+	dexSizes   map[dexIdentity]uint32 // Begin -> Size
 
 	// 方法记录使用sync.Map + 原子操作
 	methodRecordsMu sync.Mutex
-	methodRecords   map[uint64][]MethodCodeRecord // Begin -> records
+	methodRecords   map[dexIdentity][]MethodCodeRecord // Begin -> records
 
 	// 分片接收状态：在Go侧重组eBPF分片
 	pendingDexMu sync.Mutex
-	pendingDex   map[uint64]*dexRecvState // Begin -> state
+	pendingDex   map[dexIdentity]*dexRecvState // Begin -> state
 
 	// Worker pool for parallel method event processing
 	methodTaskChan chan methodTask
@@ -76,10 +77,11 @@ type DexDumper struct {
 // jniMethod is one captured RegisterNatives entry. fnPtr is an absolute runtime
 // address, later resolved to a module-relative offset when symbols are written.
 type jniMethod struct {
-	pid   uint32
-	fnPtr uint64
-	name  string
-	sig   string
+	source Source
+	pid    uint32
+	fnPtr  uint64
+	name   string
+	sig    string
 }
 
 // JSON导出条目
@@ -364,6 +366,14 @@ func (dd *DexDumper) Stop() error {
 	close(dd.methodTaskChan)
 	dd.workerWg.Wait()
 
+	dd.pendingDexMu.Lock()
+	for identity, pending := range dd.pendingDex {
+		src := identity.source()
+		src.ExpectedBytes = uint64(pending.total)
+		src.ReadBytes = uint64(pending.recv)
+		recordFailure("dex", src, fmt.Errorf("incomplete DEX: received %d of %d bytes", pending.recv, pending.total))
+	}
+	dd.pendingDexMu.Unlock()
 	dd.flushJSON()
 	dd.writeJniSymbols()
 
@@ -372,6 +382,7 @@ func (dd *DexDumper) Stop() error {
 		log.Printf("[+] Auto-fixing DEX files...")
 		if err := FixDexDirectory(outputPath); err != nil {
 			log.Printf("[!] Auto-fix failed: %v", err)
+			return err
 		}
 	}
 	return nil
@@ -390,9 +401,9 @@ func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace, autoFi
 		executeOffset:         executeOffset,
 		nterpOffset:           nterpOffset,
 		registerNativesOffset: registerNativesOffset,
-		dexSizes:              make(map[uint64]uint32),
-		methodRecords:         make(map[uint64][]MethodCodeRecord),
-		pendingDex:            make(map[uint64]*dexRecvState),
+		dexSizes:              make(map[dexIdentity]uint32),
+		methodRecords:         make(map[dexIdentity][]MethodCodeRecord),
+		pendingDex:            make(map[dexIdentity]*dexRecvState),
 		methodTaskChan:        make(chan methodTask, 4096), // 缓冲通道
 	}
 
@@ -409,7 +420,7 @@ func NewDexDumper(libArtPath string, uid uint32, outputDir string, trace, autoFi
 func (dd *DexDumper) methodWorker() {
 	defer dd.workerWg.Done()
 	for task := range dd.methodTaskChan {
-		dd.processMethodEvent(task.data)
+		dd.processMethodEvent(task.data, task.identity)
 	}
 }
 
@@ -424,7 +435,7 @@ func (dd *DexDumper) handleDexEventRingBuf(CPU int, data []byte, ringBuf *manage
 
 	// 保存 dex 文件大小，供JSON导出文件名使用
 	dd.dexSizesMu.Lock()
-	dd.dexSizes[dexHeader.Begin] = dexHeader.Size
+	dd.dexSizes[dexID(dexHeader.Pid, dexHeader.Begin)] = dexHeader.Size
 	dd.dexSizesMu.Unlock()
 
 	// eBPF层已开始分片发送，此处不再 process_vm_readv。
@@ -435,19 +446,24 @@ func (dd *DexDumper) handleMethodEventRingBuf(CPU int, data []byte, perfMap *man
 	if dd.stopped.Load() || len(data) < int(unsafe.Sizeof(methodEventHeader{})) {
 		return
 	}
+	var hdr methodEventHeader
+	if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &hdr); err != nil {
+		return
+	}
+	identity := dexID(hdr.Pid, hdr.Begin)
 	// 复制数据并分发到 worker pool
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 	select {
-	case dd.methodTaskChan <- methodTask{data: dataCopy}:
+	case dd.methodTaskChan <- methodTask{data: dataCopy, identity: identity}:
 	default:
 		// 通道满时直接处理，避免阻塞 ringbuf
-		dd.processMethodEvent(dataCopy)
+		dd.processMethodEvent(dataCopy, identity)
 	}
 }
 
 // processMethodEvent 实际处理方法事件
-func (dd *DexDumper) processMethodEvent(data []byte) {
+func (dd *DexDumper) processMethodEvent(data []byte, identity dexIdentity) {
 	buf := bytes.NewBuffer(data)
 	methodHeader := methodEventHeader{}
 	if err := binary.Read(buf, binary.LittleEndian, &methodHeader); err != nil {
@@ -463,7 +479,7 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 		bytecode = buf.Next(int(methodHeader.CodeitemSize))
 	}
 
-	parser := dexCache.GetParser(methodHeader.Begin)
+	parser := dexCache.GetParser(identity)
 
 	var methodName string
 
@@ -472,7 +488,10 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 		methodName = fmt.Sprintf("method_idx_%d", methodHeader.MethodIndex)
 	} else {
 		// 使用sync.Map无锁查询缓存
-		cacheKey := (methodHeader.Begin << 20) | uint64(methodHeader.MethodIndex)
+		cacheKey := struct {
+			Dex    dexIdentity
+			Method uint32
+		}{identity, methodHeader.MethodIndex}
 		if cached, ok := dd.methodSigCache.Load(cacheKey); ok {
 			methodName = cached.(string)
 		} else {
@@ -506,7 +525,7 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 				CodeHex:   hex.EncodeToString(bytecode),
 			}
 			dd.methodRecordsMu.Lock()
-			dd.methodRecords[methodHeader.Begin] = append(dd.methodRecords[methodHeader.Begin], rec)
+			dd.methodRecords[identity] = append(dd.methodRecords[identity], rec)
 			dd.methodRecordsMu.Unlock()
 		}
 	} else {
@@ -524,11 +543,11 @@ func (dd *DexDumper) processMethodEvent(data []byte) {
 func (dd *DexDumper) flushJSON() {
 	dd.methodRecordsMu.Lock()
 	records := dd.methodRecords
-	dd.methodRecords = make(map[uint64][]MethodCodeRecord)
+	dd.methodRecords = make(map[dexIdentity][]MethodCodeRecord)
 	dd.methodRecordsMu.Unlock()
 
 	dd.dexSizesMu.RLock()
-	sizes := make(map[uint64]uint32, len(dd.dexSizes))
+	sizes := make(map[dexIdentity]uint32, len(dd.dexSizes))
 	for k, v := range dd.dexSizes {
 		sizes[k] = v
 	}
@@ -546,24 +565,15 @@ func (dd *DexDumper) flushJSON() {
 			}
 		}
 
-		fileName := fmt.Sprintf("%s/dex_%x_%x_code.json", outputPath, begin, size)
-		f, err := os.Create(fileName)
+		fileName := dexArtifactPath(outputPath, begin, size, "_code.json")
+		data, err := json.MarshalIndent(recs, "", "  ")
+		if err == nil {
+			err = writeArtifact(fileName, data, "dex_code", "complete", begin.source())
+		}
 		if err != nil {
-			log.Printf("Create JSON file failed: %v", err)
-			continue
+			log.Printf("Write JSON failed: %v", err)
 		}
 
-		// 使用bufio提升写入性能
-		writer := bufio.NewWriter(f)
-		enc := json.NewEncoder(writer)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(recs); err != nil {
-			log.Printf("Write JSON failed: %v", err)
-		} else {
-			writer.Flush()
-			log.Printf("Saved code records to %s (%d entries)", fileName, len(recs))
-		}
-		f.Close()
 	}
 }
 
@@ -587,7 +597,7 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 	}
 	payload := buf.Next(int(hdr.DataLen))
 
-	begin := hdr.Begin
+	begin := dexID(hdr.Pid, hdr.Begin)
 	// A completed fallback must not be replaced by late ring-buffer chunks.
 	if dexCache.GetParser(begin) != nil {
 		return
@@ -632,17 +642,15 @@ func (dd *DexDumper) handleDexChunkEventRingBuf(CPU int, data []byte, ringBuf *m
 			log.Printf("Failed to add dex file to cache: %v", err)
 		}
 
-		fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, hdr.Size)
-		f, err := os.Create(fileName)
-		if err != nil {
-			log.Printf("Create file failed: %v", err)
+		fileName := dexArtifactPath(outputPath, begin, hdr.Size, ".dex")
+		src := begin.source()
+		src.ExpectedBytes = uint64(hdr.Size)
+		src.ReadBytes = uint64(len(dataCopy))
+		if err := writeArtifact(fileName, dataCopy, "dex", "complete", src); err != nil {
+			log.Printf("Write DEX failed: %v", err)
 			return
 		}
-		defer f.Close()
-		if _, err := f.Write(dataCopy); err != nil {
-			log.Printf("Write dexData failed: %v", err)
-			return
-		}
+
 		log.Printf("Dex file saved to %s, size %d", fileName, len(dataCopy))
 		return
 	}
@@ -663,8 +671,18 @@ func (dd *DexDumper) handleJniEventRingBuf(CPU int, data []byte, ringBuf *manage
 	if name == "" {
 		return
 	}
+	src := processSource(evt.Pid, 0)
+	if mods, err := ScanSoModules(int(evt.Pid), "", true, true); err == nil {
+		for _, mod := range mods {
+			if evt.FnPtr >= mod.Base && evt.FnPtr < mod.End {
+				src.ModulePath = mod.Path
+				src.Base = fmt.Sprintf("0x%x", mod.Base)
+				break
+			}
+		}
+	}
 	dd.jniMu.Lock()
-	dd.jniMethods = append(dd.jniMethods, jniMethod{pid: evt.Pid, fnPtr: evt.FnPtr, name: name, sig: goCStr(evt.Sig[:])})
+	dd.jniMethods = append(dd.jniMethods, jniMethod{source: src, pid: evt.Pid, fnPtr: evt.FnPtr, name: name, sig: goCStr(evt.Sig[:])})
 	dd.jniMu.Unlock()
 }
 
@@ -682,8 +700,7 @@ func goCStr(b []int8) string {
 	return string(out)
 }
 
-// writeJniSymbols resolves each captured JNI function pointer to the module that
-// owns it (via that process's /proc/<pid>/maps) and writes per-module
+// writeJniSymbols uses the module identity observed at capture and writes per-module
 // "offset name" files ready for `fixso --symbols`, plus a raw capture. Called at
 // Stop; a no-op if nothing was captured.
 func (dd *DexDumper) writeJniSymbols() {
@@ -694,45 +711,44 @@ func (dd *DexDumper) writeJniSymbols() {
 		return
 	}
 
-	modCache := map[uint32][]soModule{}
-	getMods := func(pid uint32) []soModule {
-		if m, ok := modCache[pid]; ok {
-			return m
-		}
-		var mods []soModule
-		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid)); err == nil {
-			mods = groupSoModules(parseMapEntries(string(data)), "", true, true, func(a uint64) bool { return peekIsElf(int(pid), a) })
-		}
-		modCache[pid] = mods
-		return mods
-	}
-
 	perMod := map[string]*bytes.Buffer{}
+	sources := map[string]Source{}
 	raw := &bytes.Buffer{}
 	seen := map[string]bool{}
 	for _, m := range methods {
-		key := fmt.Sprintf("%d_%x", m.pid, m.fnPtr)
+		key := fmt.Sprintf("%s_%x", sourceKey(m.source), m.fnPtr)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		fmt.Fprintf(raw, "%d 0x%x %s %s\n", m.pid, m.fnPtr, m.name, m.sig)
-		for _, mod := range getMods(m.pid) {
-			if m.fnPtr >= mod.Base && m.fnPtr < mod.End {
-				b := perMod[mod.Name]
-				if b == nil {
-					b = &bytes.Buffer{}
-					perMod[mod.Name] = b
-				}
-				fmt.Fprintf(b, "0x%x %s\n", m.fnPtr-mod.Base, m.name)
-				break
-			}
+		src := m.source
+		base, err := strconv.ParseUint(strings.TrimPrefix(src.Base, "0x"), 16, 64)
+		if err != nil || src.ModulePath == "" || src.StartTicks == "" || src.BootID == "" || m.fnPtr < base {
+			recordFailure("jni_symbols", src, fmt.Errorf("module identity unavailable at JNI capture"))
+			continue
 		}
+		key = fmt.Sprintf("%s_%s_%s", sourceKey(src), src.Base, src.ModulePath)
+		b := perMod[key]
+		if b == nil {
+			b = &bytes.Buffer{}
+			perMod[key] = b
+			sources[key] = src
+		}
+		fmt.Fprintf(b, "0x%x %s\n", m.fnPtr-base, m.name)
+
 	}
 
-	_ = os.WriteFile(filepath.Join(outputPath, "jni_symbols_raw.txt"), raw.Bytes(), 0644)
-	for name, b := range perMod {
-		_ = os.WriteFile(filepath.Join(outputPath, "jni_symbols_"+sanitizeSoName(name)+".txt"), b.Bytes(), 0644)
+	if err := writeArtifact(filepath.Join(outputPath, "symbols", "jni_symbols_raw.txt"), raw.Bytes(), "jni_raw", "complete", Source{}); err != nil {
+		log.Printf("Write JNI raw failed: %v", err)
+	}
+	for key, b := range perMod {
+		src := sources[key]
+		identity := sha256.Sum256([]byte(key))
+		name := fmt.Sprintf("jni_symbols_%x.txt", identity[:12])
+		if err := writeArtifact(filepath.Join(outputPath, "symbols", name), b.Bytes(), "jni_symbols", "complete", src); err != nil {
+			log.Printf("Write JNI symbols failed: %v", err)
+		}
 	}
 	log.Printf("[+] Captured %d JNI method(s) across %d module(s); wrote jni_symbols_*.txt under %s (feed to: fixso --symbols)", len(seen), len(perMod), outputPath)
 }
@@ -758,7 +774,8 @@ func (dd *DexDumper) handleReadFailureEventRingBuf(CPU int, data []byte, ringBuf
 
 func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize uint32, startOffset uint32) {
 	begin = untagAddr(begin)
-	if dexCache.GetParser(begin) != nil {
+	identity := dexID(pid, begin)
+	if dexCache.GetParser(identity) != nil {
 		return
 	}
 	buf, err := readDexImage(begin, totalSize, func(address uintptr, dst []byte) error {
@@ -767,6 +784,7 @@ func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize u
 		})
 	})
 	if err != nil {
+		recordFailure("dex", identity.source(), err)
 		log.Printf("[dex-fallback] failed to read dex 0x%x (pid=%d off=%d): %v", begin, pid, startOffset, err)
 		return
 	}
@@ -776,27 +794,25 @@ func (dd *DexDumper) readRemoteDexFallback(begin uint64, pid uint32, totalSize u
 	}
 
 	dd.pendingDexMu.Lock()
-	delete(dd.pendingDex, begin)
+	delete(dd.pendingDex, identity)
 	dd.pendingDexMu.Unlock()
 
 	dd.dexSizesMu.Lock()
-	dd.dexSizes[begin] = outSize
+	dd.dexSizes[identity] = outSize
 	dd.dexSizesMu.Unlock()
 
-	if err := dexCache.AddDexFile(begin, buf); err != nil {
+	if err := dexCache.AddDexFile(identity, buf); err != nil {
 		log.Printf("Failed to add dex file to cache: %v", err)
 	}
 
-	fileName := fmt.Sprintf("%s/dex_%x_%x.dex", outputPath, begin, outSize)
-	f, err := os.Create(fileName)
-	if err != nil {
-		log.Printf("Create file failed: %v", err)
+	fileName := dexArtifactPath(outputPath, identity, outSize, ".dex")
+	src := identity.source()
+	src.ExpectedBytes = uint64(outSize)
+	src.ReadBytes = uint64(len(buf))
+	if err := writeArtifact(fileName, buf, "dex", "complete", src); err != nil {
+		log.Printf("Write DEX failed: %v", err)
 		return
 	}
-	defer f.Close()
-	if _, err := f.Write(buf); err != nil {
-		log.Printf("Write dexData failed: %v", err)
-		return
-	}
+
 	log.Printf("Dex file saved to %s (fallback readRemoteMem), size %d", fileName, len(buf))
 }
