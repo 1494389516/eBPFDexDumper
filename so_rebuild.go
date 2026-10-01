@@ -1,5 +1,3 @@
-//go:build arm64
-
 package main
 
 import (
@@ -17,6 +15,7 @@ const ptDynamic = 2
 const (
 	shtNull        = 0
 	shtProgbits    = 1
+	shtSymtab      = 2
 	shtStrtab      = 3
 	shtRela        = 4
 	shtHash        = 5
@@ -96,6 +95,29 @@ func (l elfLayout) shdrSize() int { return pick(l.is64, 64, 40) }
 func (l elfLayout) dynSize() int  { return pick(l.is64, 16, 8) }
 func (l elfLayout) symSize() int  { return pick(l.is64, 24, 16) }
 func (l elfLayout) word() uint64  { return uint64(pick(l.is64, 8, 4)) }
+
+func validateProgramHeaders(data []byte, l elfLayout) error {
+	if len(data) < l.ehdrSize() {
+		return fmt.Errorf("truncated ELF header")
+	}
+	offset := l.phoff(data)
+	stride := l.phentsize(data)
+	if stride == 0 {
+		stride = l.phdrSize()
+	}
+	count := l.phnum(data)
+	if offset == 0 || count == 0 {
+		return fmt.Errorf("no program headers")
+	}
+	if stride < l.phdrSize() {
+		return fmt.Errorf("program header entry too small: %d", stride)
+	}
+	size := uint64(count) * uint64(stride)
+	if offset > uint64(len(data)) || size > uint64(len(data))-offset {
+		return fmt.Errorf("program header table out of bounds")
+	}
+	return nil
+}
 
 func pick(is64 bool, a, b int) int {
 	if is64 {
@@ -201,6 +223,26 @@ func (l elfLayout) putShdr(b []byte, name, typ uint32, flags, addr, off, size ui
 	}
 }
 
+// putSym writes one symbol table entry in the right class layout. NB: ELF32 and
+// ELF64 order the fields differently.
+func (l elfLayout) putSym(b []byte, name uint32, value, size uint64, info, other byte, shndx uint16) {
+	if l.is64 {
+		le.PutUint32(b[0:4], name)
+		b[4] = info
+		b[5] = other
+		le.PutUint16(b[6:8], shndx)
+		le.PutUint64(b[8:16], value)
+		le.PutUint64(b[16:24], size)
+	} else {
+		le.PutUint32(b[0:4], name)
+		le.PutUint32(b[4:8], uint32(value))
+		le.PutUint32(b[8:12], uint32(size))
+		b[12] = info
+		b[13] = other
+		le.PutUint16(b[14:16], shndx)
+	}
+}
+
 // secDesc is a work-in-progress section header, with link/info kept as names
 // until the final index assignment.
 type secDesc struct {
@@ -215,11 +257,34 @@ type secDesc struct {
 	info     uint32
 	entsize  uint64
 	align    uint64
+	fileData []byte // non-alloc appended section payload (.symtab/.strtab); offset set at emit
+	fileOff  uint64
 }
 
 type loadSeg struct {
 	vaddr, filesz, memsz uint64
 	flags                uint32
+}
+
+// InjectedSym is a caller-supplied symbol (e.g. a recovered JNI function name
+// at a known offset) to write into a real .symtab so IDA/Ghidra show the name.
+type InjectedSym struct {
+	Name  string
+	Value uint64 // offset within the module
+}
+
+// sectionIndexOf returns the index of the allocatable section whose address
+// range contains value, or 0 (SHN_UNDEF) if none does.
+func sectionIndexOf(value uint64, secs []secDesc) uint16 {
+	for i, s := range secs {
+		if s.flags&shfAlloc == 0 || s.size == 0 {
+			continue
+		}
+		if value >= s.addr && value < s.addr+s.size {
+			return uint16(i)
+		}
+	}
+	return 0
 }
 
 // RebuildSoSections takes a memory image of an ELF shared object (ELF32 or
@@ -233,7 +298,7 @@ type loadSeg struct {
 // VERSYM/VERDEF/VERNEED/INIT_ARRAY/FINI_ARRAY give the addresses (and often the
 // sizes) of the corresponding sections. Sections whose size isn't directly
 // known are sized from the next section's start after sorting by address.
-func RebuildSoSections(image []byte) ([]byte, error) {
+func RebuildSoSections(image []byte, injected []InjectedSym) ([]byte, error) {
 	data := make([]byte, len(image))
 	copy(data, image)
 
@@ -252,6 +317,9 @@ func RebuildSoSections(image []byte) ([]byte, error) {
 	l := elfLayout{is64: data[4] == 2}
 	if len(data) < l.ehdrSize() {
 		return nil, fmt.Errorf("image smaller than ELF header")
+	}
+	if err := validateProgramHeaders(data, l); err != nil {
+		return nil, err
 	}
 
 	phoff := l.phoff(data)
@@ -569,8 +637,29 @@ func RebuildSoSections(image []byte) ([]byte, error) {
 		}
 	}
 
-	// Reassemble: NULL + sorted allocatable sections + .shstrtab.
+	// Reassemble: NULL + sorted allocatable sections + injected .symtab/.strtab
+	// + .shstrtab.
 	secs = append([]secDesc{secs[0]}, body...)
+
+	// Injected symbols become a real .symtab/.strtab appended at the end of the
+	// file (non-alloc), so tools display caller-supplied names such as recovered
+	// JNI functions. st_shndx points at the rebuilt section containing the value.
+	if len(injected) > 0 {
+		symSz := l.symSize()
+		strtab := []byte{0}
+		symtab := make([]byte, (len(injected)+1)*symSz) // entry 0 is the null symbol
+		for i, s := range injected {
+			nameOff := uint32(len(strtab))
+			strtab = append(strtab, []byte(s.Name)...)
+			strtab = append(strtab, 0)
+			l.putSym(symtab[(i+1)*symSz:], nameOff, s.Value, 0, 0x12, 0, sectionIndexOf(s.Value, secs)) // STB_GLOBAL|STT_FUNC
+		}
+		secs = append(secs,
+			secDesc{name: ".symtab", typ: shtSymtab, entsize: uint64(symSz), align: l.word(), fileData: symtab, linkName: ".strtab", info: 1},
+			secDesc{name: ".strtab", typ: shtStrtab, align: 1, fileData: strtab},
+		)
+	}
+
 	shstrtabIdx := len(secs)
 	secs = append(secs, secDesc{name: ".shstrtab", typ: shtStrtab, align: 1})
 
@@ -604,7 +693,19 @@ func RebuildSoSections(image []byte) ([]byte, error) {
 		remapSymShndx(l, data, int(symAddr), symcount, secs)
 	}
 
-	// Lay out appended data at end of file: [.shstrtab][shdr table].
+	// Lay out appended data at end of file: [non-alloc section payloads]
+	// [.shstrtab][shdr table]. Non-alloc sections (.symtab/.strtab) carry their
+	// bytes in fileData and get their file offset assigned here.
+	for i := range secs {
+		if secs[i].fileData == nil {
+			continue
+		}
+		for secs[i].align > 1 && uint64(len(data))%secs[i].align != 0 {
+			data = append(data, 0)
+		}
+		secs[i].fileOff = uint64(len(data))
+		data = append(data, secs[i].fileData...)
+	}
 	shstrtabOff := uint64(len(data))
 	data = append(data, shstrtab...)
 	for len(data)%int(l.word()) != 0 { // align shdr table to class word size
@@ -621,12 +722,17 @@ func RebuildSoSections(image []byte) ([]byte, error) {
 			shName = nameOff[s.name]
 		}
 		var shOffset, shAddr, shSize uint64 = 0, 0, s.size
-		switch s.name {
-		case "":
+		switch {
+		case s.name == "":
 			// NULL section: all zero
-		case ".shstrtab":
+		case s.name == ".shstrtab":
 			shOffset = shstrtabOff
 			shSize = uint64(len(shstrtab))
+		case s.fileData != nil:
+			// non-alloc appended section (.symtab/.strtab): lives in the file
+			// only, no memory address
+			shOffset = s.fileOff
+			shSize = uint64(len(s.fileData))
 		default:
 			shAddr = s.addr
 			shOffset = s.addr // memory image: offset == addr
